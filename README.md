@@ -13,13 +13,31 @@ Se re-aplica solo después de cada `sudo apt upgrade`, así que solo hay que ins
 
 ## Instalación
 
+Copia y pega esto en una terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/SmowlJose/slack-notification-fix/main/install.sh | sudo sh
+```
+
+Después, **cierra Slack del todo y vuelve a abrirlo** (menú *Archivo → Salir*, no solo cerrar la ventana).
+
+<details>
+<summary>¿No tienes <code>curl</code>? Usa <code>wget</code></summary>
+
+```bash
+wget -qO- https://raw.githubusercontent.com/SmowlJose/slack-notification-fix/main/install.sh | sudo sh
+```
+</details>
+
+<details>
+<summary>Alternativa: clonar el repo (si prefieres revisar el código antes de ejecutarlo)</summary>
+
 ```bash
 git clone https://github.com/SmowlJose/slack-notification-fix.git
 cd slack-notification-fix
 sudo ./install.sh
 ```
-
-Después, **cierra Slack del todo y vuelve a abrirlo** (menú *Archivo → Salir*, no solo cerrar la ventana).
+</details>
 
 Si todo ha ido bien verás:
 
@@ -58,9 +76,10 @@ Solo tienes que reiniciar Slack, como harías igualmente para usar la versión n
 ## Desinstalar
 
 ```bash
-cd slack-notification-fix
-sudo ./install.sh uninstall
+curl -fsSL https://raw.githubusercontent.com/SmowlJose/slack-notification-fix/main/install.sh | sudo sh -s uninstall
 ```
+
+(Si lo instalaste clonando el repo, también vale `sudo ./install.sh uninstall` desde esa carpeta.)
 
 Restaura el Slack original y elimina el hook. Reinicia Slack después.
 
