@@ -1,0 +1,227 @@
+#!/usr/bin/python3 -I
+"""
+slack-notification-fix: hace que las notificaciones de Slack (Linux) sigan
+llevando al mensaje/canal/hilo aunque se pulsen pasados unos segundos.
+
+Causa: en la ruta Linux, Slack crea el objeto Notification de Electron y no
+guarda ninguna referencia a él. En cuanto el recolector de basura de V8 lo
+libera (normalmente a los pocos segundos), Electron desconecta el delegado
+nativo y el clic que llega desde GNOME ya no tiene a quién avisar.
+
+Parche: se retiene cada notificación en un Set global hasta que se pulsa,
+se responde o se cierra (máximo MAX_RETAINED, descartando la más antigua).
+
+Uso:
+  slack-notification-fix check     # 0 = parcheado, 1 = sin parchear, 2 = patrón no encontrado
+  slack-notification-fix apply     # parchea si hace falta (requiere root)
+  slack-notification-fix restore   # restaura el app.asar original guardado
+Opciones: --asar RUTA (por defecto /usr/lib/slack/resources/app.asar),
+          --backup-dir RUTA (por defecto /var/lib/slack-notification-fix), --quiet
+"""
+import argparse
+import copy
+import hashlib
+import json
+import os
+import re
+import shutil
+import struct
+import sys
+
+DEFAULT_ASAR = "/usr/lib/slack/resources/app.asar"
+DEFAULT_BACKUP_DIR = "/var/lib/slack-notification-fix"
+TARGET = ("dist", "main.bundle.cjs")
+MARKER = b"__slackNotificationFix"
+MAX_RETAINED = 200
+BLOCK_SIZE = 4 * 1024 * 1024
+
+# Constructor de la notificación Electron de Linux:
+#   j.vF.info("Creating new Electron notification.");const r=...;this.toast=new de.Notification(r),
+ANCHOR = re.compile(
+    rb'Creating new Electron notification\."\).{0,300}?this\.toast=new [\w$]+\.Notification\([\w$]+\),',
+    re.S,
+)
+INJECTION = (
+    b'((k,f)=>{k.add(this);for(const e of["close","click","reply","action"])this.toast.once(e,f);'
+    b"if(k.size>" + str(MAX_RETAINED).encode() + b")k.delete(k.values().next().value)})"
+    b"(globalThis." + MARKER + b"??=new Set,()=>globalThis." + MARKER + b".delete(this)),"
+)
+
+quiet = False
+backup_dir = DEFAULT_BACKUP_DIR
+
+
+def log(msg, always=False):
+    if always or not quiet:
+        print(f"slack-notification-fix: {msg}")
+
+
+def warn(msg):
+    print(f"slack-notification-fix: AVISO: {msg}", file=sys.stderr)
+
+
+class Asar:
+    """Lector/escritor mínimo del formato asar (cabecera Pickle + JSON + datos)."""
+
+    def __init__(self, raw):
+        self.raw = raw
+        _, header_size = struct.unpack("<II", self.raw[:8])
+        _, json_len = struct.unpack("<II", self.raw[8:16])
+        self.header = json.loads(self.raw[16 : 16 + json_len])
+        self.base = 8 + header_size
+
+    def entry(self, parts):
+        node = self.header
+        for p in parts:
+            node = node["files"][p]
+        return node
+
+    def read(self, parts):
+        e = self.entry(parts)
+        start = self.base + int(e["offset"])
+        return self.raw[start : start + e["size"]]
+
+    @classmethod
+    def open(cls, path):
+        with open(path, "rb") as f:
+            return cls(f.read())
+
+    def packed_files(self, header=None):
+        """Lista (ruta, entrada) de los ficheros empaquetados, en orden de offset."""
+        out = []
+
+        def walk(node, prefix):
+            for name, child in node["files"].items():
+                if "files" in child:
+                    walk(child, prefix + (name,))
+                elif "offset" in child:
+                    out.append((prefix + (name,), child))
+
+        walk(header or self.header, ())
+        return sorted(out, key=lambda pe: int(pe[1]["offset"]))
+
+    def build(self, parts, new_content):
+        """Devuelve los bytes de un asar nuevo con el fichero `parts` sustituido."""
+        header = copy.deepcopy(self.header)
+        chunks, pos = [], 0
+        for path, e in self.packed_files(header):
+            data = new_content if path == parts else self.read(path)
+            e["offset"] = str(pos)
+            e["size"] = len(data)
+            if path == parts and "integrity" in e:
+                e["integrity"] = integrity(data)
+            chunks.append(data)
+            pos += len(data)
+
+        header_json = json.dumps(header, separators=(",", ":"), ensure_ascii=False).encode()
+        padded = header_json + b"\0" * (-len(header_json) % 4)
+        header_pickle = struct.pack("<II", 4 + len(padded), len(header_json)) + padded
+        return struct.pack("<II", 4, len(header_pickle)) + header_pickle + b"".join(chunks)
+
+
+def integrity(data):
+    blocks = [hashlib.sha256(data[i : i + BLOCK_SIZE]).hexdigest() for i in range(0, max(len(data), 1), BLOCK_SIZE)]
+    return {"algorithm": "SHA256", "hash": hashlib.sha256(data).hexdigest(), "blockSize": BLOCK_SIZE, "blocks": blocks}
+
+
+def status(asar):
+    """0 = parcheado, 1 = parcheable, 2 = patrón no encontrado (Slack ha cambiado)."""
+    content = asar.read(TARGET)
+    if MARKER in content:
+        return 0, content, None
+    matches = list(ANCHOR.finditer(content))
+    if len(matches) != 1:
+        return 2, content, None
+    return 1, content, matches[0]
+
+
+def slack_version(asar):
+    try:
+        return json.loads(asar.read(("package.json",)))["version"]
+    except Exception:
+        return "desconocida"
+
+
+def cmd_check(path):
+    asar = Asar.open(path)
+    code, _, _ = status(asar)
+    log({0: "parcheado", 1: "SIN parchear", 2: "patrón no encontrado"}[code] + f" (Slack {slack_version(asar)})")
+    return code
+
+
+def cmd_apply(path):
+    asar = Asar.open(path)
+    version = slack_version(asar)
+    code, content, match = status(asar)
+    if code == 0:
+        log(f"Slack {version} ya está parcheado.")
+        return 0
+    if code == 2:
+        warn(f"no se encuentra el código de notificaciones en Slack {version}; parche NO aplicado.")
+        return 2
+
+    patched = content[: match.end()] + INJECTION + content[match.end() :]
+    new_raw = asar.build(TARGET, patched)
+
+    # Verificación: el asar nuevo debe tener los mismos ficheros, idénticos salvo el parcheado.
+    check = Asar(new_raw)
+    old_files = [p for p, _ in asar.packed_files()]
+    new_files = [p for p, _ in check.packed_files()]
+    if new_files != old_files or any(
+        check.read(p) != (patched if p == TARGET else asar.read(p)) for p in old_files
+    ):
+        warn("la verificación del asar generado ha fallado; no se modifica nada.")
+        return 3
+
+    os.makedirs(backup_dir, exist_ok=True)
+    shutil.copy2(path, os.path.join(backup_dir, "app.asar.orig"))
+    with open(os.path.join(backup_dir, "app.asar.orig.version"), "w") as f:
+        f.write(version + "\n")
+
+    tmp = os.path.join(os.path.dirname(path), ".app.asar.slack-notification-fix.tmp")
+    with open(tmp, "wb") as f:
+        f.write(new_raw)
+    st = os.stat(path)
+    os.chmod(tmp, st.st_mode & 0o7777)
+    os.chown(tmp, st.st_uid, st.st_gid)
+    os.replace(tmp, path)
+    log(f"Slack {version} parcheado. Reinicia Slack para aplicar el cambio.", always=True)
+    return 0
+
+
+def cmd_restore(path):
+    backup = os.path.join(backup_dir, "app.asar.orig")
+    if not os.path.exists(backup):
+        warn("no hay copia de seguridad que restaurar.")
+        return 1
+    with open(backup + ".version") as f:
+        backup_version = f.read().strip()
+    current = slack_version(Asar.open(path))
+    if backup_version != current:
+        warn(f"la copia es de Slack {backup_version} y la instalada es {current}; no se restaura.")
+        return 1
+    tmp = os.path.join(os.path.dirname(path), ".app.asar.slack-notification-fix.tmp")
+    shutil.copy2(backup, tmp)
+    os.replace(tmp, path)
+    log(f"Restaurado el app.asar original de Slack {current}.")
+    return 0
+
+
+def main():
+    global quiet, backup_dir
+    parser = argparse.ArgumentParser(description="Parche de clic tardío en notificaciones de Slack para Linux.")
+    parser.add_argument("command", choices=["check", "apply", "restore"], nargs="?", default="check")
+    parser.add_argument("--asar", default=DEFAULT_ASAR)
+    parser.add_argument("--backup-dir", default=DEFAULT_BACKUP_DIR)
+    parser.add_argument("--quiet", action="store_true")
+    args = parser.parse_args()
+    quiet = args.quiet
+    backup_dir = args.backup_dir
+    if not os.path.exists(args.asar):
+        log(f"{args.asar} no existe; nada que hacer.")
+        return 0
+    return {"check": cmd_check, "apply": cmd_apply, "restore": cmd_restore}[args.command](args.asar)
+
+
+if __name__ == "__main__":
+    sys.exit(main())
